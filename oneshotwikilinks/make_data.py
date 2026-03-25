@@ -35,7 +35,7 @@ def getCategories(threshold):
     import json
     import re
     
-    model = SentenceTransformer('all-mpnet-base-v2')
+    model = SentenceTransformer('bert-base-nli-mean-tokens')
         
     for entity, freq in categoryCount().items():
         if freq >= threshold:
@@ -51,7 +51,7 @@ def makeData(threshold, categories):
     from collections import defaultdict
     import json
     
-    model = SentenceTransformer('all-mpnet-base-v2')
+    model = SentenceTransformer('bert-base-nli-mean-tokens')
     catcount = defaultdict(int)
     
     with open('shuffled_dedup_entities.tsv') as f:
@@ -97,7 +97,7 @@ def makeData(threshold, categories):
 
 class MyDataset(torch.utils.data.Dataset):
     def __init__(self, threshold):
-        from tqdm.notebook import tqdm
+        from tqdm import tqdm
         self.labelfeats = { k: (n, v) for n, (k, v) in enumerate(getCategories(threshold)) } 
         Xs = []
         ys = []
@@ -207,4 +207,4 @@ def get_embd(dataset):
 
 if __name__ == '__main__':
     datasetStats(2000), datasetStats(1000), datasetStats(100)
-    makeMyDataset(2000)
+    makeMyDataset(10)
