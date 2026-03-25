@@ -1,16 +1,18 @@
 import torch
 import argparse
 from transformers import T5Tokenizer, T5ForConditionalGeneration
-import re
 from sentence_transformers import SentenceTransformer
 import json
 import os
 import torch.nn as nn
 import numpy as np
-import time
+import re
+import gzip
+import pickle
+from tqdm import tqdm
 
 # ==========================================
-# 1. New Addition: The Anisotropic Wrapper
+# 1. The Anisotropic Wrapper
 # ==========================================
 class AnisotropicLLMWrapper:
     def __init__(self, action_features, lam=1.0, L_sq=10000.0):
@@ -33,7 +35,7 @@ class AnisotropicLLMWrapper:
         return theta_llm, uncertainty_llm
 
 # ==========================================
-# 2. Original Helper Functions
+# 2. Data Structures & Helpers
 # ==========================================
 class EasyAcc:
     def __init__(self):
@@ -50,86 +52,23 @@ class EasyAcc:
     def mean(self):
         return self.sum / max(self.n, 1)
 
-def categoryCount():
-    import gzip
-    counts = {}
-    with gzip.open('oneshotwikilinks/entityfreq.gz', 'rt') as f:
-        for line in f:
-            try:
-                freq, entity = line.strip().split()
-            except:
-                continue
-            counts[entity] = int(freq)
-    return counts
-
-def getCategories(threshold):
-    import re
-    model = SentenceTransformer('bert-base-nli-mean-tokens')
-    for entity, freq in categoryCount().items():
-        if freq >= threshold:
-            niceentity = re.sub(r'_', r' ', entity)
-            embedcat = model.encode([niceentity])[0]
-            yield entity, embedcat
-
-def makeData(threshold, categories):
-    from collections import defaultdict
-    model = SentenceTransformer('bert-base-nli-mean-tokens')
-    catcount = defaultdict(int)
-    
-    with open('oneshotwikilinks/shuffled_dedup_entities.tsv') as f:
-        batchline, batchencode, batchentity = [], [], []
-        for line in f:
-            try:
-                entity, pre, mention, post = line.strip().split('\t')
-            except:
-                continue
-                
-            if entity in categories and catcount[entity] < threshold:
-                catcount[entity] += 1
-                batchline.append(line)
-                batchencode.append(pre)
-                batchencode.append(post)
-                batchentity.append(entity)
-
-                if len(batchline) == 5:
-                    embed = model.encode(batchencode)
-                    for n, (line, entity) in enumerate(zip(batchline, batchentity)):
-                        embedpre, embedpost = embed[2*n], embed[2*n+1]
-                        entityord, entityvec = categories[entity]
-                        yield { 'line': line, 'entityord': entityord, 'entityvec': entityvec, 'pre': embedpre, 'post': embedpost }
-                    batchline, batchencode, batchentity = [], [], []
-
+# Note: MyDataset definition must remain here so pickle can load it
 class MyDataset(torch.utils.data.Dataset):
     def __init__(self, threshold):
-        from tqdm import tqdm
-        self.labelfeats = { n: (n, v) for n, (k, v) in enumerate(getCategories(threshold)) } 
-        Xs, ys, pre_texts, post_texts, text_entities = [], [], [], [], []
-        for n, what in tqdm(enumerate(makeData(threshold, self.labelfeats))):
-            pre = torch.tensor(what['pre'])
-            post = torch.tensor(what['post'])
-            Xs.append(torch.cat((pre, post)).unsqueeze(0))
-            ys.append(what['entityord'])
-            pre_texts.append(pre)
-            post_texts.append(post)
-        self.Xs = torch.cat(Xs, dim=0)
-        self.ys = torch.LongTensor(ys)
-        self.pre_texts = pre_texts
-        self.post_texts = post_texts
+        pass # Full generation logic lives in make_data.py
             
     def __len__(self):
         return self.Xs.shape[0]
 
     def __getitem__(self, index):
-        return self.Xs[index], self.ys[index], self.pre_texts[index], self.post_texts[index], ""
+        return self.Xs[index], self.ys[index], self.pre_texts[index], self.post_texts[index], self.text_entities[index]
 
 def loadMyDataset(threshold):
-    import gzip
-    import pickle
-    with gzip.open(f'oneshotwikilinks/mydataset.{threshold}.pickle.gz', 'rb') as handle:
+    with gzip.open(f'mydataset.{threshold}.pickle.gz', 'rb') as handle:
         return pickle.load(handle)
 
 def load_model_and_tokenizer(model_name, device):
-    tokenizer = T5Tokenizer.from_pretrained(model_name)
+    tokenizer = T5Tokenizer.from_pretrained(model_name, legacy=False)
     model = T5ForConditionalGeneration.from_pretrained(model_name).to(device)
     return model, tokenizer
 
@@ -137,7 +76,8 @@ def generate_mask_fillings(sentences, model, tokenizer, device):
     input_texts = [f"question: {sent.replace('[MASK]', '<extra_id_0>')}" for sent in sentences]
     inputs = tokenizer(input_texts, return_tensors="pt", padding=True, truncation=True)
     input_ids = inputs.input_ids.to(device)
-    output_ids = model.generate(input_ids)
+    # Fixed the warning by explicitly setting max_new_tokens
+    output_ids = model.generate(input_ids, max_new_tokens=20)
     answers = [tokenizer.decode(ids, skip_special_tokens=True).split('<extra_id_0>')[-1].strip() for ids in output_ids]
     return answers
 
@@ -159,7 +99,7 @@ def get_embd(dataset):
     return torch.stack([temp_d[k] for k in sorted(temp_d.keys())])
 
 # ==========================================
-# 3. Modified Online Learning Loop
+# 3. The Online Learning Loop
 # ==========================================
 def learnOnline(dataset, rank, batch_size, cuda, seed, llm_type):
     torch.manual_seed(seed)
@@ -168,53 +108,56 @@ def learnOnline(dataset, rank, batch_size, cuda, seed, llm_type):
     entity_embd = get_embd(dataset)
     num_entities = entity_embd.shape[0]
     
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() and cuda else "cpu")
+    print(f"Running on device: {device}")
+    
     t5_model, t5_tokenizer = load_model_and_tokenizer("google/flan-t5-" + llm_type, device)
-    entity_model = SentenceTransformer('bert-base-nli-mean-tokens')
+    # Keep consistent with the embedding model used in make_data.py
+    entity_model = SentenceTransformer('bert-base-nli-mean-tokens', device=device)
     cos = nn.CosineSimilarity(dim=2, eps=1e-6)
     
     generator = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
     
     # Initialize our Custom Wrapper
-    action_features_np = entity_embd.numpy()
+    action_features_np = entity_embd.cpu().numpy()
     llm_wrapper = AnisotropicLLMWrapper(action_features_np, lam=1.0, L_sq=10000.0)
     
-    # Initialize LinUCB
-    d_context = 768  # Using pre_texts embedding size
+    # Initialize LinUCB dynamically based on the exact embedding context size
+    sample_X = next(iter(generator))[0]
+    d_context = sample_X.shape[1] 
     V_lin = np.eye(d_context)
     b_lin = np.zeros(d_context)
     
     avreward_combined = EasyAcc()
-    combined_reward_history = []
     
     print("Starting Deterministic Routing Experiment...")
     
     for bno, (Xs, ys, pre_texts, post_texts, text_entities) in enumerate(generator):
         Xs, ys = Xs.to(device), ys.to(device)
         
-        # 1. Get LLM Predictions
+        # 1. Get LLM Predictions using the REAL text contexts
         with torch.no_grad():
-            # For simplicity, we decode pre_texts back to text in a real scenario, 
-            # but using dummy text here to match your original function signature.
-            dummy_text = ["text" for _ in range(len(Xs))]
-            lm_predicted_labels = language_model_outputs(dummy_text, dummy_text, entity_model, t5_tokenizer, t5_model, entity_model, entity_embd, num_entities, cos, device)
+            lm_predicted_labels = language_model_outputs(pre_texts, post_texts, entity_model, t5_tokenizer, t5_model, entity_model, entity_embd, num_entities, cos, device)
             
         # 2. Iterate through the batch to route deterministically
         for i in range(len(Xs)):
-            context_x = pre_texts[i].numpy() # 768-dim context
+            # Grab the mathematical vector for LinUCB math, not the string!
+            context_x = Xs[i].cpu().numpy() 
             llm_choice = lm_predicted_labels[i].item()
             true_label = ys[i].item()
             
             # --- Our Routing Logic ---
+            # Ask the Wrapper for the LLM's uncertainty
             _, u_llm = llm_wrapper.get_prediction_and_uncertainty(llm_choice, context_x)
             
+            # Calculate LinUCB's uncertainty
             vx = np.linalg.solve(V_lin, context_x)
             u_lin = float(np.dot(context_x, vx))
             
+            # The Deterministic Switchboard
             if u_llm <= u_lin:
                 final_action = llm_choice
             else:
-                # Basic LinUCB prediction logic for demonstration
                 theta_hat = np.linalg.solve(V_lin, b_lin)
                 scores = action_features_np @ theta_hat 
                 final_action = np.argmax(scores)
@@ -228,9 +171,9 @@ def learnOnline(dataset, rank, batch_size, cuda, seed, llm_type):
             
         if bno % 10 == 0:
             print(f"Batch {bno} | Combined Accuracy: {avreward_combined.mean():.4f}")
-            combined_reward_history.append(avreward_combined.mean())
             
     print("Experiment Complete!")
+    print(f"Final Combined Accuracy: {avreward_combined.mean():.4f}")
     
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -238,5 +181,6 @@ if __name__ == '__main__':
     parser.add_argument('--llm_type', type=str, default='small')
     args = parser.parse_args()
     
-    mydata = loadMyDataset(2000)
+    # Ensure this matches the threshold you used in make_data.py
+    mydata = loadMyDataset(10) 
     learnOnline(mydata, rank=50, batch_size=32, cuda=True, seed=args.seed, llm_type=args.llm_type)
