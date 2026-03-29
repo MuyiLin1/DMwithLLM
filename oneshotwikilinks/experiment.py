@@ -77,13 +77,12 @@ def generate_mask_fillings(sentences, model, tokenizer, device):
     inputs = tokenizer(input_texts, return_tensors="pt", padding=True, truncation=True)
     input_ids = inputs.input_ids.to(device)
     attention_mask = inputs.attention_mask.to(device)
-    # Fixed the warning by explicitly setting max_new_tokens
     output_ids = model.generate(input_ids, attention_mask=attention_mask, max_new_tokens=20)
     answers = [tokenizer.decode(ids, skip_special_tokens=True).split('<extra_id_0>')[-1].strip() for ids in output_ids]
     return answers
 
 def language_model_outputs(pre_texts, post_texts, sentence_model, t5_tokenizer, t5_model, entity_model, entity_embd, num_entities, cos, device):
-    sentences = [(pre_tokens + ' [MASK]. ' + post_tokens) for pre_tokens, post_tokens in zip(pre_texts, post_texts)]
+    sentences = [(pre_tokens + ' [MASK]. ' + post_tokens) for pre_tokens, post_texts in zip(pre_texts, post_texts)]
     predicted_entities = generate_mask_fillings(sentences, t5_model, t5_tokenizer, device)
     predicted_entities_embd = torch.FloatTensor(entity_model.encode(predicted_entities)).to(device)
     predicted_entities_embd = torch.unsqueeze(predicted_entities_embd, 1).repeat(1, num_entities, 1)
@@ -119,71 +118,82 @@ def learnOnline(dataset, rank, batch_size, cuda, seed, llm_type):
     print(f"Running on device: {device}")
     
     t5_model, t5_tokenizer = load_model_and_tokenizer("google/flan-t5-" + llm_type, device)
-    # Keep consistent with the embedding model used in make_data.py
     entity_model = SentenceTransformer('bert-base-nli-mean-tokens', device=device)
     cos = nn.CosineSimilarity(dim=2, eps=1e-6)
     
     generator = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
     
-    # Initialize our Custom Wrapper
+    # Initialize wrapper with RAW features (No normalization)
     action_features_np = entity_embd.cpu().numpy()
     llm_wrapper = AnisotropicLLMWrapper(action_features_np, lam=1.0, L_sq=10000.0)
     
-    # FAST INITIALIZATION: Sherman-Morrison Inverse Matrix (768-dim space)
-    d_context = action_features_np.shape[1] # 768
+    # Standard LinUCB Initialization
+    d_context = action_features_np.shape[1] 
     V_inv = np.eye(d_context)
     b_lin = np.zeros(d_context)
     
     avreward_combined = EasyAcc()
     
     print(f"Starting Deterministic Routing Experiment with LLM: {llm_type}...")
+    print(f"Total batches to process: {len(generator)}")
     
+    total_llm_picks = 0
+    total_linucb_picks = 0
+
     for bno, (Xs, ys, pre_texts, post_texts, text_entities) in enumerate(generator):
         Xs, ys = Xs.to(device), ys.to(device)
         
-        # 1. Get LLM Predictions using the REAL text contexts
         with torch.no_grad():
             lm_predicted_labels = language_model_outputs(pre_texts, post_texts, entity_model, t5_tokenizer, t5_model, entity_model, entity_embd, num_entities, cos, device)
             
-        # 2. Iterate through the batch to route deterministically
         for i in range(len(Xs)):
-            # Grab the mathematical vector for LinUCB math
-            context_x = Xs[i].cpu().numpy() # 1536-dim (pre+post concatenated)
-            
-            # MATH FIX: Use ONLY the 'pre' text embedding (first 768 dimensions)
+            context_x = Xs[i].cpu().numpy() 
             d = context_x.shape[0] // 2
+            
+            # RAW VECTOR
             context_x_llm = context_x[:d]
             
             llm_choice = lm_predicted_labels[i].item()
             true_label = ys[i].item()
             
-            # --- Our Routing Logic ---
-            # Ask the Wrapper for the LLM's uncertainty
+            # 1. Get raw variance from LLM
             _, u_llm = llm_wrapper.get_prediction_and_uncertainty(llm_choice, context_x_llm)
             
-            # FAST Calculate LinUCB's uncertainty using V_inv
+            # 2. Get raw variance from LinUCB
             vx = V_inv @ context_x_llm
-            u_lin = float(np.dot(context_x_llm, vx))
+            variance = float(np.dot(context_x_llm, vx))
             
-            # The Deterministic Switchboard
-            if u_llm <= u_lin:
-                final_action = llm_choice
+            # 3. RELATIVE NORMALIZATION FIX 
+            # Divide both by squared length to convert to percentages
+            x_norm_sq = float(np.dot(context_x_llm, context_x_llm))
+            
+            if x_norm_sq > 0:
+                relative_u_llm = u_llm / x_norm_sq
+                relative_u_lin = variance / x_norm_sq
             else:
-                # FAST Theta hat calculation using V_inv
+                relative_u_llm = u_llm
+                relative_u_lin = variance
+                
+            # 4. The Deterministic Switchboard
+            if relative_u_llm <= relative_u_lin:
+                final_action = llm_choice
+                total_llm_picks += 1
+            else:
                 theta_hat = V_inv @ b_lin
                 scores = action_features_np @ theta_hat
                 final_action = np.argmax(scores)
+                total_linucb_picks += 1
                 
-            # Update metrics and LinUCB background model
+            # 5. Reward & Updates
             reward = 1.0 if final_action == true_label else 0.0
             avreward_combined += reward
             
-            # FAST Sherman-Morrison Update for V_inv
-            V_inv -= np.outer(vx, vx) / (1.0 + u_lin)
+            # Update LinUCB using the RAW mathematical variance
+            V_inv -= np.outer(vx, vx) / (1.0 + variance)
             b_lin += reward * context_x_llm
             
         if bno % 10 == 0:
-            print(f"Batch {bno} | Combined Accuracy: {avreward_combined.mean():.4f}")
+            print(f"Batch {bno} | Combined Accuracy: {avreward_combined.mean():.4f} | LLM Picks: {total_llm_picks} | LinUCB Picks: {total_linucb_picks}")
             
     print("Experiment Complete!")
     print(f"Final Combined Accuracy: {avreward_combined.mean():.4f}")
@@ -191,9 +201,8 @@ def learnOnline(dataset, rank, batch_size, cuda, seed, llm_type):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--seed', type=int, default=1)
-    parser.add_argument('--llm_type', type=str, default='large') # Swapped default to large!
+    parser.add_argument('--llm_type', type=str, default='large') 
     args = parser.parse_args()
     
-    # Ensure this matches the threshold you used in make_data.py
     mydata = loadMyDataset(2000)
     learnOnline(mydata, rank=50, batch_size=128, cuda=True, seed=args.seed, llm_type=args.llm_type)
