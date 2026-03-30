@@ -162,32 +162,45 @@ def learnOnline(dataset, rank, batch_size, cuda, seed, llm_type):
             # 1. Get raw variance from LLM
             _, u_llm = llm_wrapper.get_prediction_and_uncertainty(llm_choice, context_x_llm)
             
-            # 2. Get raw variance from LinUCB
-            vx = V_inv @ context_x_llm
-            variance = float(np.dot(context_x_llm, vx))
+            # 2. ALIGNMENT WITH PAPER: Calculate LinUCB scores for ALL actions
+            # We create a joint feature matrix for all entities by multiplying the context with all action features
+            joint_features_all = action_features_np * context_x_llm 
             
-            # 3. RELATIVE NORMALIZATION FIX 
-            # Divide both by squared length to convert to percentages
+            # 3. Calculate LinUCB Uncertainty and Proposal (Line 4-5 of Algorithm 1)
+            # The paper calculates the proposal by maximizing score + confidence bound
+            theta_hat = V_inv @ b_lin
+            base_scores = joint_features_all @ theta_hat
+            
+            # Calculate uncertainty for all actions to find LinUCB's proposal
+            # (In practice, for 311 entities, this matrix math is fast)
+            V_inv_features = joint_features_all @ V_inv
+            variances = np.sum(joint_features_all * V_inv_features, axis=1)
+            
+            # We apply your relative normalization and exploration weight here
             x_norm_sq = float(np.dot(context_x_llm, context_x_llm))
-            
             if x_norm_sq > 0:
+                relative_variances = variances / x_norm_sq
                 relative_u_llm = u_llm / x_norm_sq
-                relative_u_lin = variance / x_norm_sq
             else:
+                relative_variances = variances
                 relative_u_llm = u_llm
-                relative_u_lin = variance
-            
+                
             exploration_weight = 5000.0
-            u_lin_effective = relative_u_lin * exploration_weight
-
-            # 4. The Deterministic Switchboard
-            if relative_u_llm <= u_lin_effective:
+            u_lin_effective_all = relative_variances * exploration_weight
+            
+            # LinUCB's proposed action is the one with the highest UCB score
+            ucb_scores = base_scores + np.sqrt(u_lin_effective_all)
+            linucb_choice = np.argmax(ucb_scores)
+            
+            # 4. The Deterministic Switchboard (Lines 11-19 of Algorithm 1)
+            # Compare the LLM's uncertainty against LinUCB's uncertainty for its proposed action
+            u_lin_proposed = u_lin_effective_all[linucb_choice]
+            
+            if relative_u_llm <= u_lin_proposed:
                 final_action = llm_choice
                 total_llm_picks += 1
             else:
-                theta_hat = V_inv @ b_lin
-                scores = action_features_np @ theta_hat
-                final_action = np.argmax(scores)
+                final_action = linucb_choice
                 total_linucb_picks += 1
                 
             # 5. Reward & Updates
@@ -195,10 +208,12 @@ def learnOnline(dataset, rank, batch_size, cuda, seed, llm_type):
             avreward_combined += reward
             batch_correct += reward
             
-            # Update LinUCB using the RAW mathematical variance
-            V += np.outer(context_x_llm, context_x_llm)
+            # ALIGNMENT WITH PAPER: Update using the joint feature of the CHOSEN action (Line 22)
+            chosen_x_ta = joint_features_all[final_action]
+            
+            V += np.outer(chosen_x_ta, chosen_x_ta)
             V_inv = np.linalg.inv(V)
-            b_lin += reward * context_x_llm
+            b_lin += reward * chosen_x_ta
             
         if bno % 10 == 0:
             batch_acc = batch_correct / len(Xs)
