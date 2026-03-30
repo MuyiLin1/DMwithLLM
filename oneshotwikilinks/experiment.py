@@ -177,7 +177,7 @@ def learnOnline(dataset, rank, batch_size, cuda, seed, llm_type):
                 relative_u_llm = u_llm
                 relative_u_lin = variance
             
-            exploration_weight = 1000.0
+            exploration_weight = 5000.0
             u_lin_effective = relative_u_lin * exploration_weight
 
             # 4. The Deterministic Switchboard
