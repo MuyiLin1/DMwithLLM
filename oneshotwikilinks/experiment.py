@@ -143,6 +143,8 @@ def learnOnline(dataset, rank, batch_size, cuda, seed, llm_type):
 
     for bno, (Xs, ys, pre_texts, post_texts, text_entities) in enumerate(generator):
         Xs, ys = Xs.to(device), ys.to(device)
+
+        batch_correct = 0
         
         with torch.no_grad():
             lm_predicted_labels = language_model_outputs(pre_texts, post_texts, entity_model, t5_tokenizer, t5_model, entity_model, entity_embd, num_entities, cos, device)
@@ -175,7 +177,7 @@ def learnOnline(dataset, rank, batch_size, cuda, seed, llm_type):
                 relative_u_llm = u_llm
                 relative_u_lin = variance
             
-            exploration_weight = 500.0
+            exploration_weight = 1000.0
             u_lin_effective = relative_u_lin * exploration_weight
 
             # 4. The Deterministic Switchboard
@@ -191,13 +193,16 @@ def learnOnline(dataset, rank, batch_size, cuda, seed, llm_type):
             # 5. Reward & Updates
             reward = 1.0 if final_action == true_label else 0.0
             avreward_combined += reward
+            batch_correct += reward
             
             # Update LinUCB using the RAW mathematical variance
-            V += np.outer(vx, vx)
+            V += np.outer(context_x_llm, context_x_llm)
+            V_inv = np.linalg.inv(V)
             b_lin += reward * context_x_llm
             
         if bno % 10 == 0:
-            print(f"Batch {bno} | Combined Accuracy: {avreward_combined.mean():.4f} | LLM Picks: {total_llm_picks} | LinUCB Picks: {total_linucb_picks}")
+            batch_acc = batch_correct / len(Xs)
+            print(f"Batch {bno} | Combined Accuracy: {avreward_combined.mean():.4f} | Batch Acc: {batch_acc:0.4f} | LLM Picks: {total_llm_picks} | LinUCB Picks: {total_linucb_picks}")
             
     print("Experiment Complete!")
     print(f"Final Combined Accuracy: {avreward_combined.mean():.4f}")
