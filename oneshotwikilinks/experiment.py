@@ -129,7 +129,8 @@ def learnOnline(dataset, rank, batch_size, cuda, seed, llm_type):
     
     # Standard LinUCB Initialization
     d_context = action_features_np.shape[1] 
-    V_inv = np.eye(d_context)
+    V = np.eye(d_context)
+    V_inv = np.linalg.inv(V)
     b_lin = np.zeros(d_context)
     
     avreward_combined = EasyAcc()
@@ -192,7 +193,7 @@ def learnOnline(dataset, rank, batch_size, cuda, seed, llm_type):
             avreward_combined += reward
             
             # Update LinUCB using the RAW mathematical variance
-            V_inv -= np.outer(vx, vx) / (1.0 + variance)
+            V += np.outer(vx, vx)
             b_lin += reward * context_x_llm
             
         if bno % 10 == 0:
