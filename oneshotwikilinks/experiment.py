@@ -172,11 +172,10 @@ def learnOnline(dataset, rank, batch_size, cuda, seed, llm_type):
             base_scores = joint_features_all @ theta_hat
             
             # Calculate uncertainty for all actions to find LinUCB's proposal
-            # (In practice, for 311 entities, this matrix math is fast)
             V_inv_features = joint_features_all @ V_inv
             variances = np.sum(joint_features_all * V_inv_features, axis=1)
             
-            # We apply your relative normalization and exploration weight here
+            # We apply your relative normalization here
             x_norm_sq = float(np.dot(context_x_llm, context_x_llm))
             if x_norm_sq > 0:
                 relative_variances = variances / x_norm_sq
@@ -185,17 +184,20 @@ def learnOnline(dataset, rank, batch_size, cuda, seed, llm_type):
                 relative_variances = variances
                 relative_u_llm = u_llm
                 
-            exploration_weight = 3000.0
-            u_lin_effective_all = relative_variances * exploration_weight
+            # ---------------------------------------------------------
+            # DECOUPLE THE BRAIN FROM THE RUNWAY
+            # ---------------------------------------------------------
             
-            # LinUCB's proposed action is the one with the highest UCB score
-            ucb_scores = base_scores + np.sqrt(u_lin_effective_all)
+            # 3. LinUCB's Brain: Use a normal alpha (e.g., 1.0) so it actually uses its learned knowledge
+            alpha = 1.0
+            ucb_scores = base_scores + alpha * np.sqrt(relative_variances)
             linucb_choice = np.argmax(ucb_scores)
             
-            # 4. The Deterministic Switchboard (Lines 11-19 of Algorithm 1)
-            # Compare the LLM's uncertainty against LinUCB's uncertainty for its proposed action
-            u_lin_proposed = u_lin_effective_all[linucb_choice]
+            # 4. The Switchboard Runway: Use the massive multiplier ONLY to delay the handoff
+            runway_weight = 3000.0
+            u_lin_proposed = relative_variances[linucb_choice] * runway_weight
             
+            # Compare the LLM's uncertainty against LinUCB's scaled uncertainty for its proposed action
             if relative_u_llm <= u_lin_proposed:
                 final_action = llm_choice
                 total_llm_picks += 1
