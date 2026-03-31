@@ -185,7 +185,7 @@ def learnOnline(dataset, rank, batch_size, cuda, seed, llm_type):
                 relative_variances = variances
                 relative_u_llm = u_llm
                 
-            exploration_weight = 5000.0
+            exploration_weight = 3000.0
             u_lin_effective_all = relative_variances * exploration_weight
             
             # LinUCB's proposed action is the one with the highest UCB score
