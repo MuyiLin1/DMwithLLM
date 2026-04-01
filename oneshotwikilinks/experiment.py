@@ -123,19 +123,26 @@ def learnOnline(dataset, rank, batch_size, cuda, seed, llm_type):
     
     generator = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
     
-    # Initialize wrapper with RAW features (No normalization)
     action_features_np = entity_embd.cpu().numpy()
     llm_wrapper = AnisotropicLLMWrapper(action_features_np, lam=1.0, L_sq=10000.0)
     
-    # Standard LinUCB Initialization
+    # ---------------------------------------------------------
+    # INITIALIZATIONS
+    # ---------------------------------------------------------
     d_context = action_features_np.shape[1] 
+    
+    # LinUCB Brain Initialization
     V = np.eye(d_context)
     V_inv = np.linalg.inv(V)
     b_lin = np.zeros(d_context)
     
+    # Adaptive Calibration Initialization (The "B.S. Detector")
+    adapter_theta = np.zeros(d_context)
+    adapter_lr = 0.1 # Learning rate for the penalty
+    
     avreward_combined = EasyAcc()
     
-    print(f"Starting Deterministic Routing Experiment with LLM: {llm_type}...")
+    print(f"Starting Adaptive Routing Experiment with LLM: {llm_type}...")
     print(f"Total batches to process: {len(generator)}")
     
     total_llm_picks = 0
@@ -153,7 +160,7 @@ def learnOnline(dataset, rank, batch_size, cuda, seed, llm_type):
             context_x = Xs[i].cpu().numpy() 
             d = context_x.shape[0] // 2
             
-            # RAW VECTOR
+            # RAW CONTEXT VECTOR
             context_x_llm = context_x[:d]
             
             llm_choice = lm_predicted_labels[i].item()
@@ -162,20 +169,17 @@ def learnOnline(dataset, rank, batch_size, cuda, seed, llm_type):
             # 1. Get raw variance from LLM
             _, u_llm = llm_wrapper.get_prediction_and_uncertainty(llm_choice, context_x_llm)
             
-            # 2. ALIGNMENT WITH PAPER: Calculate LinUCB scores for ALL actions
-            # We create a joint feature matrix for all entities by multiplying the context with all action features
+            # 2. Joint feature matrix (Context * Action)
             joint_features_all = action_features_np * context_x_llm 
             
-            # 3. Calculate LinUCB Uncertainty and Proposal (Line 4-5 of Algorithm 1)
-            # The paper calculates the proposal by maximizing score + confidence bound
+            # 3. LinUCB Base Scores & Variances
             theta_hat = V_inv @ b_lin
             base_scores = joint_features_all @ theta_hat
             
-            # Calculate uncertainty for all actions to find LinUCB's proposal
             V_inv_features = joint_features_all @ V_inv
             variances = np.sum(joint_features_all * V_inv_features, axis=1)
             
-            # We apply your relative normalization here
+            # 4. Relative Normalization
             x_norm_sq = float(np.dot(context_x_llm, context_x_llm))
             if x_norm_sq > 0:
                 relative_variances = variances / x_norm_sq
@@ -185,34 +189,50 @@ def learnOnline(dataset, rank, batch_size, cuda, seed, llm_type):
                 relative_u_llm = u_llm
                 
             # ---------------------------------------------------------
-            # DECOUPLE THE BRAIN FROM THE RUNWAY
+            # ADAPTIVE CALIBRATION (The Adapter)
             # ---------------------------------------------------------
+            # Evaluate how much the LLM has lied in this direction previously
+            calibration_penalty = float(np.dot(adapter_theta, context_x_llm))
             
-            # 3. LinUCB's Brain: Use a normal alpha (e.g., 1.0) so it actually uses its learned knowledge
-            alpha = 1.0
+            # Inflate the LLM's uncertainty based on its past mistakes
+            calibrated_u_llm = relative_u_llm * (1.0 + max(0.0, calibration_penalty))
+            
+            # ---------------------------------------------------------
+            # LINUCB PROPOSAL (The Brain)
+            # ---------------------------------------------------------
+            alpha = 1.0 # Standard UCB exploration parameter
             ucb_scores = base_scores + alpha * np.sqrt(relative_variances)
             linucb_choice = np.argmax(ucb_scores)
             
-            # 4. The Switchboard Runway: Use the massive multiplier ONLY to delay the handoff
-            runway_weight = 3000.0
+            # ---------------------------------------------------------
+            # THE SWITCHBOARD (The Runway)
+            # ---------------------------------------------------------
+            runway_weight = 3000.0 # Huge weight to delay the handoff
             u_lin_proposed = relative_variances[linucb_choice] * runway_weight
             
-            # Compare the LLM's uncertainty against LinUCB's scaled uncertainty for its proposed action
-            if relative_u_llm <= u_lin_proposed:
+            if calibrated_u_llm <= u_lin_proposed:
                 final_action = llm_choice
                 total_llm_picks += 1
             else:
                 final_action = linucb_choice
                 total_linucb_picks += 1
                 
-            # 5. Reward & Updates
+            # ---------------------------------------------------------
+            # REWARDS & UPDATES
+            # ---------------------------------------------------------
             reward = 1.0 if final_action == true_label else 0.0
             avreward_combined += reward
             batch_correct += reward
             
-            # ALIGNMENT WITH PAPER: Update using the joint feature of the CHOSEN action (Line 22)
-            chosen_x_ta = joint_features_all[final_action]
+            # UPDATE 1: The Contextual Adapter
+            # If the LLM drove and got it wrong, spike the penalty for next time
+            if final_action == llm_choice:
+                llm_error = 1.0 - reward
+                adapter_theta += adapter_lr * llm_error * context_x_llm
             
+            # UPDATE 2: LinUCB Brain
+            # Update using the joint feature of the action that was ACTUALLY played
+            chosen_x_ta = joint_features_all[final_action]
             V += np.outer(chosen_x_ta, chosen_x_ta)
             V_inv = np.linalg.inv(V)
             b_lin += reward * chosen_x_ta
