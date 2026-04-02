@@ -6,7 +6,6 @@ import json
 import os
 import torch.nn as nn
 import numpy as np
-import re
 import gzip
 import pickle
 from tqdm import tqdm
@@ -52,10 +51,9 @@ class EasyAcc:
     def mean(self):
         return self.sum / max(self.n, 1)
 
-# Note: MyDataset definition must remain here so pickle can load it
 class MyDataset(torch.utils.data.Dataset):
     def __init__(self, threshold):
-        pass # Full generation logic lives in make_data.py
+        pass 
         
     def __len__(self):
         return self.Xs.shape[0]
@@ -126,23 +124,35 @@ def learnOnline(dataset, rank, batch_size, cuda, seed, llm_type):
     action_features_np = entity_embd.cpu().numpy()
     llm_wrapper = AnisotropicLLMWrapper(action_features_np, lam=1.0, L_sq=10000.0)
     
-    # ---------------------------------------------------------
-    # INITIALIZATIONS
-    # ---------------------------------------------------------
     d_context = action_features_np.shape[1] 
     
-    # LinUCB Brain Initialization
+    # ---------------------------------------------------------
+    # EXPERIMENT INITIALIZATIONS
+    # ---------------------------------------------------------
+    # 1. Hybrid Method (Our Method) Initialization
     V = np.eye(d_context)
     V_inv = np.linalg.inv(V)
     b_lin = np.zeros(d_context)
-    
-    # Adaptive Calibration Initialization (The "B.S. Detector")
     adapter_theta = np.zeros(d_context)
-    adapter_lr = 0.1 # Learning rate for the penalty
+    adapter_lr = 0.0001 
     
-    avreward_combined = EasyAcc()
+    # 2. Cold LinUCB (Baseline) Initialization
+    V_cold = np.eye(d_context)
+    V_cold_inv = np.linalg.inv(V_cold)
+    b_cold = np.zeros(d_context)
     
-    print(f"Starting Adaptive Routing Experiment with LLM: {llm_type}...")
+    # 3. Trackers
+    acc_hybrid = EasyAcc()
+    acc_llm_only = EasyAcc()
+    acc_linucb_only = EasyAcc()
+    
+    # 4. JSON Graph History Lists
+    history_batches = []
+    history_hybrid = []
+    history_llm = []
+    history_linucb = []
+    
+    print(f"Starting 3-Baseline Adaptive Routing Experiment with LLM: {llm_type}...")
     print(f"Total batches to process: {len(generator)}")
     
     total_llm_picks = 0
@@ -150,8 +160,6 @@ def learnOnline(dataset, rank, batch_size, cuda, seed, llm_type):
 
     for bno, (Xs, ys, pre_texts, post_texts, text_entities) in enumerate(generator):
         Xs, ys = Xs.to(device), ys.to(device)
-
-        batch_correct = 0
         
         with torch.no_grad():
             lm_predicted_labels = language_model_outputs(pre_texts, post_texts, entity_model, t5_tokenizer, t5_model, entity_model, entity_embd, num_entities, cos, device)
@@ -159,28 +167,52 @@ def learnOnline(dataset, rank, batch_size, cuda, seed, llm_type):
         for i in range(len(Xs)):
             context_x = Xs[i].cpu().numpy() 
             d = context_x.shape[0] // 2
-            
-            # RAW CONTEXT VECTOR
             context_x_llm = context_x[:d]
             
             llm_choice = lm_predicted_labels[i].item()
             true_label = ys[i].item()
             
-            # 1. Get raw variance from LLM
+            joint_features_all = action_features_np * context_x_llm 
+            x_norm_sq = float(np.dot(context_x_llm, context_x_llm))
+
+            # =========================================================
+            # TRACK 1: BASELINE LLM ONLY
+            # =========================================================
+            reward_llm = 1.0 if llm_choice == true_label else 0.0
+            acc_llm_only += reward_llm
+
+            # =========================================================
+            # TRACK 2: BASELINE COLD LINUCB ONLY
+            # =========================================================
+            theta_cold = V_cold_inv @ b_cold
+            base_scores_cold = joint_features_all @ theta_cold
+            
+            V_inv_features_cold = joint_features_all @ V_cold_inv
+            variances_cold = np.sum(joint_features_all * V_inv_features_cold, axis=1)
+            relative_var_cold = variances_cold / x_norm_sq if x_norm_sq > 0 else variances_cold
+            
+            ucb_cold = base_scores_cold + 1.0 * np.sqrt(relative_var_cold)
+            choice_cold = np.argmax(ucb_cold)
+            
+            reward_cold = 1.0 if choice_cold == true_label else 0.0
+            acc_linucb_only += reward_cold
+            
+            chosen_x_cold = joint_features_all[choice_cold]
+            V_cold += np.outer(chosen_x_cold, chosen_x_cold)
+            V_cold_inv = np.linalg.inv(V_cold)
+            b_cold += reward_cold * chosen_x_cold
+
+            # =========================================================
+            # TRACK 3: OUR METHOD (HYBRID)
+            # =========================================================
             _, u_llm = llm_wrapper.get_prediction_and_uncertainty(llm_choice, context_x_llm)
             
-            # 2. Joint feature matrix (Context * Action)
-            joint_features_all = action_features_np * context_x_llm 
-            
-            # 3. LinUCB Base Scores & Variances
             theta_hat = V_inv @ b_lin
             base_scores = joint_features_all @ theta_hat
             
             V_inv_features = joint_features_all @ V_inv
             variances = np.sum(joint_features_all * V_inv_features, axis=1)
             
-            # 4. Relative Normalization
-            x_norm_sq = float(np.dot(context_x_llm, context_x_llm))
             if x_norm_sq > 0:
                 relative_variances = variances / x_norm_sq
                 relative_u_llm = u_llm / x_norm_sq
@@ -188,26 +220,17 @@ def learnOnline(dataset, rank, batch_size, cuda, seed, llm_type):
                 relative_variances = variances
                 relative_u_llm = u_llm
                 
-            # ---------------------------------------------------------
-            # ADAPTIVE CALIBRATION (The Adapter)
-            # ---------------------------------------------------------
-            # Evaluate how much the LLM has lied in this direction previously
+            # Adapter (The B.S. Detector)
             calibration_penalty = float(np.dot(adapter_theta, context_x_llm))
+            penalty_multiplier = 1.0 + min(5.0, max(0.0, calibration_penalty))
+            calibrated_u_llm = relative_u_llm * penalty_multiplier
             
-            # Inflate the LLM's uncertainty based on its past mistakes
-            calibrated_u_llm = relative_u_llm * (1.0 + max(0.0, calibration_penalty))
-            
-            # ---------------------------------------------------------
-            # LINUCB PROPOSAL (The Brain)
-            # ---------------------------------------------------------
-            alpha = 1.0 # Standard UCB exploration parameter
-            ucb_scores = base_scores + alpha * np.sqrt(relative_variances)
+            # Hybrid LinUCB Proposal
+            ucb_scores = base_scores + 1.0 * np.sqrt(relative_variances)
             linucb_choice = np.argmax(ucb_scores)
             
-            # ---------------------------------------------------------
-            # THE SWITCHBOARD (The Runway)
-            # ---------------------------------------------------------
-            runway_weight = 3000.0 # Huge weight to delay the handoff
+            # Switchboard
+            runway_weight = 5000.0 
             u_lin_proposed = relative_variances[linucb_choice] * runway_weight
             
             if calibrated_u_llm <= u_lin_proposed:
@@ -217,32 +240,46 @@ def learnOnline(dataset, rank, batch_size, cuda, seed, llm_type):
                 final_action = linucb_choice
                 total_linucb_picks += 1
                 
-            # ---------------------------------------------------------
-            # REWARDS & UPDATES
-            # ---------------------------------------------------------
-            reward = 1.0 if final_action == true_label else 0.0
-            avreward_combined += reward
-            batch_correct += reward
+            # Hybrid Updates
+            reward_hybrid = 1.0 if final_action == true_label else 0.0
+            acc_hybrid += reward_hybrid
             
-            # UPDATE 1: The Contextual Adapter
-            # If the LLM drove and got it wrong, spike the penalty for next time
             if final_action == llm_choice:
-                llm_error = 1.0 - reward
+                llm_error = 1.0 - reward_hybrid
                 adapter_theta += adapter_lr * llm_error * context_x_llm
             
-            # UPDATE 2: LinUCB Brain
-            # Update using the joint feature of the action that was ACTUALLY played
-            chosen_x_ta = joint_features_all[final_action]
-            V += np.outer(chosen_x_ta, chosen_x_ta)
+            chosen_x_hybrid = joint_features_all[final_action]
+            V += np.outer(chosen_x_hybrid, chosen_x_hybrid)
             V_inv = np.linalg.inv(V)
-            b_lin += reward * chosen_x_ta
+            b_lin += reward_hybrid * chosen_x_hybrid
             
+        # =========================================================
+        # LOGGING & SAVING
+        # =========================================================
+        # =========================================================
+        # LOGGING & CONTINUOUS SAVING
+        # =========================================================
         if bno % 10 == 0:
-            batch_acc = batch_correct / len(Xs)
-            print(f"Batch {bno} | Combined Accuracy: {avreward_combined.mean():.4f} | Batch Acc: {batch_acc:0.4f} | LLM Picks: {total_llm_picks} | LinUCB Picks: {total_linucb_picks}")
+            history_batches.append(bno)
+            history_hybrid.append(acc_hybrid.mean())
+            history_llm.append(acc_llm_only.mean())
+            history_linucb.append(acc_linucb_only.mean())
             
-    print("Experiment Complete!")
-    print(f"Final Combined Accuracy: {avreward_combined.mean():.4f}")
+            print(f"Batch {bno:4d} | Hybrid: {acc_hybrid.mean():.4f} | LLM Only: {acc_llm_only.mean():.4f} | Cold UCB: {acc_linucb_only.mean():.4f} || Hybrid Picks -> LLM: {total_llm_picks}, UCB: {total_linucb_picks}")
+            
+            # --- NEW: Save the data incrementally every 10 batches ---
+            results = {
+                "batches": history_batches,
+                "hybrid": history_hybrid,
+                "llm_only": history_llm,
+                "linucb_only": history_linucb
+            }
+            with open("experiment_results.json", "w") as f:
+                json.dump(results, f)
+            
+    print("\nExperiment Complete!")
+    print(f"Final Hybrid Accuracy: {acc_hybrid.mean():.4f}")
+    
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
