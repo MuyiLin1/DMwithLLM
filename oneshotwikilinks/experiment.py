@@ -8,6 +8,7 @@ import torch.nn as nn
 import numpy as np
 import gzip
 import pickle
+import gc
 from tqdm import tqdm
 
 # ==========================================
@@ -119,7 +120,8 @@ def learnOnline(dataset, rank, batch_size, cuda, seed, llm_type):
     entity_model = SentenceTransformer('bert-base-nli-mean-tokens', device=device)
     cos = nn.CosineSimilarity(dim=2, eps=1e-6)
     
-    generator = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
+    # Disabled multiprocessing (num_workers=0) to prevent memory leaks
+    generator = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=True)
     
     action_features_np = entity_embd.cpu().numpy()
     llm_wrapper = AnisotropicLLMWrapper(action_features_np, lam=1.0, L_sq=10000.0)
@@ -129,15 +131,17 @@ def learnOnline(dataset, rank, batch_size, cuda, seed, llm_type):
     # ---------------------------------------------------------
     # EXPERIMENT INITIALIZATIONS
     # ---------------------------------------------------------
-    # 1. Hybrid Method (Our Method) Initialization
-    V = np.eye(d_context)
+    # 1. Hybrid Method Initialization (NEW: 0.1 Ridge Regularization)
+    V = 0.1 * np.eye(d_context)
     V_inv = np.linalg.inv(V)
     b_lin = np.zeros(d_context)
+    
+    # Adapter Initialization
     adapter_theta = np.zeros(d_context)
     adapter_lr = 0.0001 
     
-    # 2. Cold LinUCB (Baseline) Initialization
-    V_cold = np.eye(d_context)
+    # 2. Cold LinUCB Initialization (NEW: 0.1 Ridge Regularization)
+    V_cold = 0.1 * np.eye(d_context)
     V_cold_inv = np.linalg.inv(V_cold)
     b_cold = np.zeros(d_context)
     
@@ -159,6 +163,13 @@ def learnOnline(dataset, rank, batch_size, cuda, seed, llm_type):
     total_linucb_picks = 0
 
     for bno, (Xs, ys, pre_texts, post_texts, text_entities) in enumerate(generator):
+        
+        # Calculate dynamic alpha at the start of the batch loop
+        current_alpha = max(0.1, 1.0 * (0.9985 ** bno))
+        
+        # --- NEW: Decay the Adapter's grudge so it lets the LLM back in later ---
+        adapter_theta *= 0.99 
+        
         Xs, ys = Xs.to(device), ys.to(device)
         
         with torch.no_grad():
@@ -191,12 +202,14 @@ def learnOnline(dataset, rank, batch_size, cuda, seed, llm_type):
             variances_cold = np.sum(joint_features_all * V_inv_features_cold, axis=1)
             relative_var_cold = variances_cold / x_norm_sq if x_norm_sq > 0 else variances_cold
             
-            ucb_cold = base_scores_cold + 1.0 * np.sqrt(relative_var_cold)
+            # Use dynamic alpha
+            ucb_cold = base_scores_cold + current_alpha * np.sqrt(relative_var_cold)
             choice_cold = np.argmax(ucb_cold)
             
             reward_cold = 1.0 if choice_cold == true_label else 0.0
             acc_linucb_only += reward_cold
             
+            # Standard matrix inversion update
             chosen_x_cold = joint_features_all[choice_cold]
             V_cold += np.outer(chosen_x_cold, chosen_x_cold)
             V_cold_inv = np.linalg.inv(V_cold)
@@ -220,13 +233,13 @@ def learnOnline(dataset, rank, batch_size, cuda, seed, llm_type):
                 relative_variances = variances
                 relative_u_llm = u_llm
                 
-            # Adapter (The B.S. Detector)
+            # Adapter (The B.S. Detector) - NEW: max penalty cap is 1.5
             calibration_penalty = float(np.dot(adapter_theta, context_x_llm))
-            penalty_multiplier = 1.0 + min(5.0, max(0.0, calibration_penalty))
+            penalty_multiplier = 1.0 + min(1.5, max(0.0, calibration_penalty))
             calibrated_u_llm = relative_u_llm * penalty_multiplier
             
-            # Hybrid LinUCB Proposal
-            ucb_scores = base_scores + 1.0 * np.sqrt(relative_variances)
+            # Hybrid LinUCB Proposal - Use dynamic alpha
+            ucb_scores = base_scores + current_alpha * np.sqrt(relative_variances)
             linucb_choice = np.argmax(ucb_scores)
             
             # Switchboard
@@ -248,14 +261,12 @@ def learnOnline(dataset, rank, batch_size, cuda, seed, llm_type):
                 llm_error = 1.0 - reward_hybrid
                 adapter_theta += adapter_lr * llm_error * context_x_llm
             
+            # Standard matrix inversion update
             chosen_x_hybrid = joint_features_all[final_action]
             V += np.outer(chosen_x_hybrid, chosen_x_hybrid)
             V_inv = np.linalg.inv(V)
             b_lin += reward_hybrid * chosen_x_hybrid
             
-        # =========================================================
-        # LOGGING & SAVING
-        # =========================================================
         # =========================================================
         # LOGGING & CONTINUOUS SAVING
         # =========================================================
@@ -267,7 +278,6 @@ def learnOnline(dataset, rank, batch_size, cuda, seed, llm_type):
             
             print(f"Batch {bno:4d} | Hybrid: {acc_hybrid.mean():.4f} | LLM Only: {acc_llm_only.mean():.4f} | Cold UCB: {acc_linucb_only.mean():.4f} || Hybrid Picks -> LLM: {total_llm_picks}, UCB: {total_linucb_picks}")
             
-            # --- NEW: Save the data incrementally every 10 batches ---
             results = {
                 "batches": history_batches,
                 "hybrid": history_hybrid,
@@ -276,10 +286,21 @@ def learnOnline(dataset, rank, batch_size, cuda, seed, llm_type):
             }
             with open("experiment_results.json", "w") as f:
                 json.dump(results, f)
-            
+                
+        # =========================================================
+        # MEMORY CLEANUP (Run at the end of EVERY batch)
+        # =========================================================
+        del Xs, ys, pre_texts, post_texts, text_entities, lm_predicted_labels
+        
+        gc.collect()
+        
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
+        elif device.type == 'mps':
+            torch.mps.empty_cache()
+
     print("\nExperiment Complete!")
     print(f"Final Hybrid Accuracy: {acc_hybrid.mean():.4f}")
-    
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
