@@ -120,7 +120,6 @@ def learnOnline(dataset, rank, batch_size, cuda, seed, llm_type):
     entity_model = SentenceTransformer('bert-base-nli-mean-tokens', device=device)
     cos = nn.CosineSimilarity(dim=2, eps=1e-6)
     
-    # Disabled multiprocessing (num_workers=0) to prevent memory leaks
     generator = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=True)
     
     action_features_np = entity_embd.cpu().numpy()
@@ -131,7 +130,7 @@ def learnOnline(dataset, rank, batch_size, cuda, seed, llm_type):
     # ---------------------------------------------------------
     # EXPERIMENT INITIALIZATIONS
     # ---------------------------------------------------------
-    # 1. Hybrid Method Initialization (NEW: 0.1 Ridge Regularization)
+    # 1. Hybrid Method Initialization 
     V = 0.1 * np.eye(d_context)
     V_inv = np.linalg.inv(V)
     b_lin = np.zeros(d_context)
@@ -139,8 +138,13 @@ def learnOnline(dataset, rank, batch_size, cuda, seed, llm_type):
     # Adapter Initialization
     adapter_theta = np.zeros(d_context)
     adapter_lr = 0.0001 
+
+    # =========================================================
+    # NEW: 1st CHANGE (Trust Initialization)
+    # =========================================================
+    linucb_trust = 55.0
     
-    # 2. Cold LinUCB Initialization (NEW: 0.1 Ridge Regularization)
+    # 2. Cold LinUCB Initialization
     V_cold = 0.1 * np.eye(d_context)
     V_cold_inv = np.linalg.inv(V_cold)
     b_cold = np.zeros(d_context)
@@ -164,11 +168,7 @@ def learnOnline(dataset, rank, batch_size, cuda, seed, llm_type):
 
     for bno, (Xs, ys, pre_texts, post_texts, text_entities) in enumerate(generator):
         
-        # Calculate dynamic alpha at the start of the batch loop
         current_alpha = max(0.1, 1.0 * (0.9985 ** bno))
-        
-        # --- NEW: Decay the Adapter's grudge so it lets the LLM back in later ---
-        adapter_theta *= 0.99 
         
         Xs, ys = Xs.to(device), ys.to(device)
         
@@ -202,14 +202,12 @@ def learnOnline(dataset, rank, batch_size, cuda, seed, llm_type):
             variances_cold = np.sum(joint_features_all * V_inv_features_cold, axis=1)
             relative_var_cold = variances_cold / x_norm_sq if x_norm_sq > 0 else variances_cold
             
-            # Use dynamic alpha
             ucb_cold = base_scores_cold + current_alpha * np.sqrt(relative_var_cold)
             choice_cold = np.argmax(ucb_cold)
             
             reward_cold = 1.0 if choice_cold == true_label else 0.0
             acc_linucb_only += reward_cold
             
-            # Standard matrix inversion update
             chosen_x_cold = joint_features_all[choice_cold]
             V_cold += np.outer(chosen_x_cold, chosen_x_cold)
             V_cold_inv = np.linalg.inv(V_cold)
@@ -233,24 +231,22 @@ def learnOnline(dataset, rank, batch_size, cuda, seed, llm_type):
                 relative_variances = variances
                 relative_u_llm = u_llm
                 
-            # Adapter (The B.S. Detector)
+            # Adapter (The B.S. Detector) 
             calibration_penalty = float(np.dot(adapter_theta, context_x_llm))
-            penalty_multiplier = 1.0 + max(0.0, calibration_penalty)
+            penalty_multiplier = 1.0 + min(1.5, max(0.0, calibration_penalty))
             calibrated_u_llm = relative_u_llm * penalty_multiplier
             
-            # Hybrid LinUCB Proposal
+            # Hybrid LinUCB Proposal 
             ucb_scores = base_scores + current_alpha * np.sqrt(relative_variances)
             linucb_choice = np.argmax(ucb_scores)
             
-            # --- THE LOGICAL BREAKTHROUGH: Error-Correction Routing ---
-            # 1. Use Standard Deviation (sqrt) instead of raw variance so the threshold doesn't collapse.
             linucb_std = np.sqrt(relative_variances[linucb_choice])
-            
-            # 2. The Baseline Floor Strategy
-            # We set a floor of 0.02. Multiplied by 55.0, the minimum threshold is permanently 1.1.
-            # Because the LLM's natural uncertainty is ~1.0, an UNPENALIZED LLM (1.0 <= 1.1) will ALWAYS drive.
             floored_std = max(0.02, linucb_std) 
-            u_lin_proposed = floored_std * 55.0 
+
+            # =========================================================
+            # NEW: 2nd CHANGE (The Algorithmic Switchboard & Updates)
+            # =========================================================
+            u_lin_proposed = floored_std * linucb_trust 
             
             if calibrated_u_llm <= u_lin_proposed:
                 final_action = llm_choice
@@ -264,10 +260,13 @@ def learnOnline(dataset, rank, batch_size, cuda, seed, llm_type):
             acc_hybrid += reward_hybrid
             
             if final_action == llm_choice:
-                # --- BUG FIX: Symmetric Adapter Learning ---
-                # Reward the LLM (-1.0) when right so the penalty heals. Penalize (+1.0) when wrong.
-                llm_error = 1.0 if reward_hybrid == 0.0 else -1.0
+                llm_error = 0.12 - reward_hybrid
                 adapter_theta += adapter_lr * llm_error * context_x_llm
+            else:
+                # The Self-Regulating Trust Override
+                trust_update = 0.12 - reward_hybrid
+                linucb_trust = max(5.0, min(100.0, linucb_trust + 5.0 * trust_update))
+            # =========================================================
             
             # Standard matrix inversion update
             chosen_x_hybrid = joint_features_all[final_action]
@@ -296,7 +295,7 @@ def learnOnline(dataset, rank, batch_size, cuda, seed, llm_type):
                 json.dump(results, f)
                 
         # =========================================================
-        # MEMORY CLEANUP (Run at the end of EVERY batch)
+        # MEMORY CLEANUP
         # =========================================================
         del Xs, ys, pre_texts, post_texts, text_entities, lm_predicted_labels
         
