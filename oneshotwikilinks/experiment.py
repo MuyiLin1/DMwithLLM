@@ -236,6 +236,7 @@ def learnOnline(dataset, rank, batch_size, cuda, seed, llm_type):
             # Adapter (The B.S. Detector) - NEW: max penalty cap is 1.5
             calibration_penalty = float(np.dot(adapter_theta, context_x_llm))
             penalty_multiplier = 1.0 + min(1.5, max(0.0, calibration_penalty))
+
             calibrated_u_llm = relative_u_llm * penalty_multiplier
             
             # Hybrid LinUCB Proposal - Use dynamic alpha
@@ -244,7 +245,9 @@ def learnOnline(dataset, rank, batch_size, cuda, seed, llm_type):
             
             # Switchboard
             runway_weight = 5000.0 
-            u_lin_proposed = relative_variances[linucb_choice] * runway_weight
+
+            floored_variance = max(0.0005, relative_variances[linucb_choice])
+            u_lin_proposed = floored_variance * runway_weight
             
             if calibrated_u_llm <= u_lin_proposed:
                 final_action = llm_choice
