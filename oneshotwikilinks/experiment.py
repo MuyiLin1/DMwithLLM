@@ -233,21 +233,24 @@ def learnOnline(dataset, rank, batch_size, cuda, seed, llm_type):
                 relative_variances = variances
                 relative_u_llm = u_llm
                 
-            # Adapter (The B.S. Detector) - NEW: max penalty cap is 1.5
+            # Adapter (The B.S. Detector)
             calibration_penalty = float(np.dot(adapter_theta, context_x_llm))
-            penalty_multiplier = 1.0 + min(1.5, max(0.0, calibration_penalty))
-
+            penalty_multiplier = 1.0 + max(0.0, calibration_penalty)
             calibrated_u_llm = relative_u_llm * penalty_multiplier
             
-            # Hybrid LinUCB Proposal - Use dynamic alpha
+            # Hybrid LinUCB Proposal
             ucb_scores = base_scores + current_alpha * np.sqrt(relative_variances)
             linucb_choice = np.argmax(ucb_scores)
             
-            # Switchboard
-            runway_weight = 5000.0 
-
-            floored_variance = max(0.0005, relative_variances[linucb_choice])
-            u_lin_proposed = floored_variance * runway_weight
+            # --- THE LOGICAL BREAKTHROUGH: Error-Correction Routing ---
+            # 1. Use Standard Deviation (sqrt) instead of raw variance so the threshold doesn't collapse.
+            linucb_std = np.sqrt(relative_variances[linucb_choice])
+            
+            # 2. The Baseline Floor Strategy
+            # We set a floor of 0.02. Multiplied by 55.0, the minimum threshold is permanently 1.1.
+            # Because the LLM's natural uncertainty is ~1.0, an UNPENALIZED LLM (1.0 <= 1.1) will ALWAYS drive.
+            floored_std = max(0.02, linucb_std) 
+            u_lin_proposed = floored_std * 55.0 
             
             if calibrated_u_llm <= u_lin_proposed:
                 final_action = llm_choice
@@ -261,7 +264,9 @@ def learnOnline(dataset, rank, batch_size, cuda, seed, llm_type):
             acc_hybrid += reward_hybrid
             
             if final_action == llm_choice:
-                llm_error = 1.0 - reward_hybrid
+                # --- BUG FIX: Symmetric Adapter Learning ---
+                # Reward the LLM (-1.0) when right so the penalty heals. Penalize (+1.0) when wrong.
+                llm_error = 1.0 if reward_hybrid == 0.0 else -1.0
                 adapter_theta += adapter_lr * llm_error * context_x_llm
             
             # Standard matrix inversion update
