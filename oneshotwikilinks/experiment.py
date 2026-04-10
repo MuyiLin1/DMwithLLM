@@ -130,31 +130,26 @@ def learnOnline(dataset, rank, batch_size, cuda, seed, llm_type):
     # ---------------------------------------------------------
     # EXPERIMENT INITIALIZATIONS
     # ---------------------------------------------------------
-    # 1. Hybrid Method Initialization 
     V = 0.1 * np.eye(d_context)
     V_inv = np.linalg.inv(V)
     b_lin = np.zeros(d_context)
     
-    # Adapter Initialization
     adapter_theta = np.zeros(d_context)
     adapter_lr = 0.0001 
 
-    # =========================================================
-    # NEW: 1st CHANGE (Trust Initialization)
-    # =========================================================
     linucb_trust = 55.0
     
-    # 2. Cold LinUCB Initialization
+    # --- NEW: Dynamic Moving Baseline ---
+    llm_moving_avg = 0.12
+    
     V_cold = 0.1 * np.eye(d_context)
     V_cold_inv = np.linalg.inv(V_cold)
     b_cold = np.zeros(d_context)
     
-    # 3. Trackers
     acc_hybrid = EasyAcc()
     acc_llm_only = EasyAcc()
     acc_linucb_only = EasyAcc()
     
-    # 4. JSON Graph History Lists
     history_batches = []
     history_hybrid = []
     history_llm = []
@@ -175,6 +170,10 @@ def learnOnline(dataset, rank, batch_size, cuda, seed, llm_type):
         with torch.no_grad():
             lm_predicted_labels = language_model_outputs(pre_texts, post_texts, entity_model, t5_tokenizer, t5_model, entity_model, entity_embd, num_entities, cos, device)
             
+        # --- NEW: Batch Level Trackers ---
+        batch_llm_correct = 0.0
+        batch_linucb_correct = 0.0
+            
         for i in range(len(Xs)):
             context_x = Xs[i].cpu().numpy() 
             d = context_x.shape[0] // 2
@@ -186,15 +185,12 @@ def learnOnline(dataset, rank, batch_size, cuda, seed, llm_type):
             joint_features_all = action_features_np * context_x_llm 
             x_norm_sq = float(np.dot(context_x_llm, context_x_llm))
 
-            # =========================================================
             # TRACK 1: BASELINE LLM ONLY
-            # =========================================================
             reward_llm = 1.0 if llm_choice == true_label else 0.0
             acc_llm_only += reward_llm
+            batch_llm_correct += reward_llm
 
-            # =========================================================
             # TRACK 2: BASELINE COLD LINUCB ONLY
-            # =========================================================
             theta_cold = V_cold_inv @ b_cold
             base_scores_cold = joint_features_all @ theta_cold
             
@@ -207,15 +203,14 @@ def learnOnline(dataset, rank, batch_size, cuda, seed, llm_type):
             
             reward_cold = 1.0 if choice_cold == true_label else 0.0
             acc_linucb_only += reward_cold
+            batch_linucb_correct += reward_cold
             
             chosen_x_cold = joint_features_all[choice_cold]
             V_cold += np.outer(chosen_x_cold, chosen_x_cold)
             V_cold_inv = np.linalg.inv(V_cold)
             b_cold += reward_cold * chosen_x_cold
 
-            # =========================================================
             # TRACK 3: OUR METHOD (HYBRID)
-            # =========================================================
             _, u_llm = llm_wrapper.get_prediction_and_uncertainty(llm_choice, context_x_llm)
             
             theta_hat = V_inv @ b_lin
@@ -231,21 +226,16 @@ def learnOnline(dataset, rank, batch_size, cuda, seed, llm_type):
                 relative_variances = variances
                 relative_u_llm = u_llm
                 
-            # Adapter (The B.S. Detector) 
             calibration_penalty = float(np.dot(adapter_theta, context_x_llm))
             penalty_multiplier = 1.0 + min(1.5, max(0.0, calibration_penalty))
             calibrated_u_llm = relative_u_llm * penalty_multiplier
             
-            # Hybrid LinUCB Proposal 
             ucb_scores = base_scores + current_alpha * np.sqrt(relative_variances)
             linucb_choice = np.argmax(ucb_scores)
             
             linucb_std = np.sqrt(relative_variances[linucb_choice])
             floored_std = max(0.02, linucb_std) 
 
-            # =========================================================
-            # NEW: 2nd CHANGE (The Algorithmic Switchboard & Updates)
-            # =========================================================
             u_lin_proposed = floored_std * linucb_trust 
             
             if calibrated_u_llm <= u_lin_proposed:
@@ -259,20 +249,26 @@ def learnOnline(dataset, rank, batch_size, cuda, seed, llm_type):
             reward_hybrid = 1.0 if final_action == true_label else 0.0
             acc_hybrid += reward_hybrid
             
+            # --- NEW: Dynamic Baseline used for penalties ---
             if final_action == llm_choice:
-                llm_error = 0.12 - reward_hybrid
+                llm_error = llm_moving_avg - reward_hybrid
                 adapter_theta += adapter_lr * llm_error * context_x_llm
             else:
-                # The Self-Regulating Trust Override
-                trust_update = 0.12 - reward_hybrid
+                trust_update = llm_moving_avg - reward_hybrid
                 linucb_trust = max(5.0, min(100.0, linucb_trust + 5.0 * trust_update))
-            # =========================================================
             
-            # Standard matrix inversion update
             chosen_x_hybrid = joint_features_all[final_action]
             V += np.outer(chosen_x_hybrid, chosen_x_hybrid)
             V_inv = np.linalg.inv(V)
             b_lin += reward_hybrid * chosen_x_hybrid
+            
+        # =========================================================
+        # NEW: 50-Batch Moving Baseline Update
+        # =========================================================
+        batch_llm_acc = batch_llm_correct / len(Xs)
+        batch_linucb_acc = batch_linucb_correct / len(Xs)
+        
+        llm_moving_avg = 0.96 * llm_moving_avg + 0.04 * batch_llm_acc
             
         # =========================================================
         # LOGGING & CONTINUOUS SAVING
@@ -283,7 +279,8 @@ def learnOnline(dataset, rank, batch_size, cuda, seed, llm_type):
             history_llm.append(acc_llm_only.mean())
             history_linucb.append(acc_linucb_only.mean())
             
-            print(f"Batch {bno:4d} | Hybrid: {acc_hybrid.mean():.4f} | LLM Only: {acc_llm_only.mean():.4f} | Cold UCB: {acc_linucb_only.mean():.4f} || Hybrid Picks -> LLM: {total_llm_picks}, UCB: {total_linucb_picks}")
+            print(f"Batch {bno:4d} | Global Hybrid: {acc_hybrid.mean():.4f} | Global LLM: {acc_llm_only.mean():.4f} | Global UCB: {acc_linucb_only.mean():.4f}")
+            print(f"           > THIS BATCH | LLM Acc: {batch_llm_acc:.4f} | UCB Acc: {batch_linucb_acc:.4f} | Moving Baseline: {llm_moving_avg:.4f} || Picks -> LLM: {total_llm_picks}, UCB: {total_linucb_picks}")
             
             results = {
                 "batches": history_batches,
